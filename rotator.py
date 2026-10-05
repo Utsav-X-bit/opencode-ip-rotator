@@ -27,7 +27,8 @@ AUTO_RECYCLE_THRESHOLD = int(os.environ.get("AUTO_RECYCLE_THRESHOLD", "50"))
 CUSTOM_OUTBOUND_PROXY = os.environ.get("CUSTOM_OUTBOUND_PROXY", "").strip()
 
 # Proxy Pool Configuration
-PROXY_LIST_FILE = os.environ.get("PROXY_LIST_FILE", "/app/data/proxies.txt")
+DEFAULT_DATA_DIR = Path("/app/data") if Path("/.dockerenv").exists() else Path(__file__).resolve().parent / "data"
+PROXY_LIST_FILE = os.environ.get("PROXY_LIST_FILE", str(DEFAULT_DATA_DIR / "proxies.txt"))
 PROXY_LIST_ENV = os.environ.get("PROXY_LIST", "").strip()
 _proxy_pool: List[str] = []
 _proxy_index = 0
@@ -101,7 +102,7 @@ active_flows_count = 0
 flow_lock = threading.Lock()
 _current_ip: Optional[str] = None
 rotation_count = 0
-FLOW_LEASE_DB_PATH = Path(os.environ.get("METRICS_DB_PATH", "/app/data/metrics.db"))
+FLOW_LEASE_DB_PATH = Path(os.environ.get("METRICS_DB_PATH", str(DEFAULT_DATA_DIR / "metrics.db")))
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -295,7 +296,7 @@ def rotate_warp(reason: str = "Triggered") -> bool:
                                     ip_history.pop(0)
 
                                 try:
-                                    db_path = Path(os.environ.get("METRICS_DB_PATH", "/app/data/metrics.db"))
+                                    db_path = FLOW_LEASE_DB_PATH
                                     if db_path.exists():
                                         conn = sqlite3.connect(str(db_path))
                                         cursor = conn.cursor()

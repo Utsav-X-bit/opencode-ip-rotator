@@ -64,7 +64,8 @@ class JSONFormatter(logging.Formatter):
 # -----------------------------------------------------------------------------
 # Proxy Pool / Custom Proxy List Support
 # -----------------------------------------------------------------------------
-PROXY_FILE = Path(os.environ.get("PROXY_LIST_FILE", "/app/data/proxies.txt"))
+DEFAULT_DATA_DIR = Path("/app/data") if Path("/.dockerenv").exists() else Path(__file__).resolve().parent / "data"
+PROXY_FILE = Path(os.environ.get("PROXY_LIST_FILE", str(DEFAULT_DATA_DIR / "proxies.txt")))
 _proxy_pool: List[str] = []
 _proxy_index = 0
 _proxy_lock = threading.Lock()
@@ -109,7 +110,7 @@ def get_next_outbound_proxy() -> Optional[Dict[str, str]]:
 # -----------------------------------------------------------------------------
 # SQLite — WAL mode + retry for concurrent safety
 # -----------------------------------------------------------------------------
-DB_FILE = Path(os.environ.get("METRICS_DB_PATH", "/app/data/metrics.db"))
+DB_FILE = Path(os.environ.get("METRICS_DB_PATH", str(DEFAULT_DATA_DIR / "metrics.db")))
 _db_lock = threading.Lock()
 
 def _get_conn():
