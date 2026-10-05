@@ -111,10 +111,12 @@ def has_active_flow_leases() -> bool:
     if not FLOW_LEASE_DB_PATH.exists():
         return False
     try:
+        now = time.time()
         conn = sqlite3.connect(str(FLOW_LEASE_DB_PATH), timeout=5)
         try:
-            conn.execute("DELETE FROM active_flow_leases WHERE expires_at <= ?", (time.time(),))
-            row = conn.execute("SELECT 1 FROM active_flow_leases LIMIT 1").fetchone()
+            conn.execute("DELETE FROM active_flow_leases WHERE expires_at <= ?", (now,))
+            conn.commit()
+            row = conn.execute("SELECT 1 FROM active_flow_leases WHERE expires_at > ? LIMIT 1", (now,)).fetchone()
             return row is not None
         finally:
             conn.close()
@@ -126,8 +128,26 @@ def has_active_flow_leases() -> bool:
         return True
 
 
+def get_effective_outbound_proxy() -> Optional[Dict[str, str]]:
+    if CUSTOM_OUTBOUND_PROXY:
+        return {"http": CUSTOM_OUTBOUND_PROXY, "https": CUSTOM_OUTBOUND_PROXY}
+    if not Path("/.dockerenv").exists():
+        import socket
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.3)
+                if s.connect_ex(("127.0.0.1", 40000)) == 0:
+                    return {"http": "socks5://127.0.0.1:40000", "https": "socks5://127.0.0.1:40000"}
+        except Exception:
+            pass
+    return None
+
+
 def get_public_ip() -> Optional[str]:
     """Fetches current public IP using Chrome TLS impersonation."""
+    proxy = get_effective_outbound_proxy()
+    if proxy:
+        return get_public_ip_via_proxy(proxy)
     try:
         from curl_cffi import requests
         resp = requests.get("https://api.ipify.org?format=json", impersonate="chrome124", timeout=5)
@@ -141,7 +161,6 @@ def get_public_ip() -> Optional[str]:
                 return resp.text.strip()
         except Exception:
             return None
-
 
 def get_public_ip_via_proxy(proxy: Dict[str, str]) -> Optional[str]:
     """Fetches current public IP using a specific proxy."""
@@ -236,7 +255,7 @@ def rotate_warp(reason: str = "Triggered") -> bool:
             # Try local WARP CLI rotation first
             warp_bin = get_warp_bin()
             if shutil.which(warp_bin) or os.path.exists(warp_bin):
-                max_attempts = 4
+                max_attempts = 2
                 for attempt in range(1, max_attempts + 1):
                     try:
                         log.info(f"WARP rotation attempt {attempt}/{max_attempts}...")
@@ -244,17 +263,22 @@ def rotate_warp(reason: str = "Triggered") -> bool:
                         time.sleep(1)
 
                         subprocess.run([warp_bin, "--accept-tos", "registration", "delete"], capture_output=True, text=True, timeout=10, check=False)
-                        time.sleep(1)
+                        for _ in range(10):
+                            time.sleep(0.3)
+                            chk = subprocess.run([warp_bin, "--accept-tos", "registration", "show"], capture_output=True, text=True, check=False)
+                            if "Missing registration" in chk.stderr or "Missing registration" in chk.stdout:
+                                break
                         subprocess.run([warp_bin, "--accept-tos", "registration", "new"], capture_output=True, text=True, timeout=10, check=False)
-                        time.sleep(1)
-
+                        time.sleep(0.5)
+                        if not Path("/.dockerenv").exists():
+                            subprocess.run([warp_bin, "--accept-tos", "mode", "proxy"], capture_output=True, text=True, timeout=10, check=False)
+                            time.sleep(0.3)
                         res = subprocess.run([warp_bin, "--accept-tos", "connect"], capture_output=True, text=True, timeout=10, check=False)
 
                         if res.returncode == 0:
-                            time.sleep(3)
+                            time.sleep(2)
                             new_ip = get_public_ip()
-
-                            if new_ip and new_ip != old_ip:
+                            if new_ip and (new_ip != old_ip or attempt == max_attempts):
                                 _current_ip = new_ip
                                 rotation_count += 1
                                 loc = get_ip_location(new_ip)
@@ -430,10 +454,9 @@ def _cleanup_warp():
     warp_bin = get_warp_bin()
     if not shutil.which(warp_bin) and not os.path.exists(warp_bin):
         return
-    log.info("Disconnecting WARP and cleaning up...")
+    log.info("Disconnecting WARP...")
     try:
         subprocess.run([warp_bin, "--accept-tos", "disconnect"], capture_output=True, text=True, timeout=10, check=False)
-        subprocess.run([warp_bin, "--accept-tos", "registration", "delete"], capture_output=True, text=True, timeout=10, check=False)
     except Exception as e:
         log.warning(f"Error during WARP cleanup: {e}")
     log.info("WARP cleanup complete.")

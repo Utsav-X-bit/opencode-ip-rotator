@@ -185,6 +185,35 @@ PROXY_LIST="http://proxy1:8080,socks5://proxy2:1080" docker compose up -d
 
 The proxy pool rotates in round-robin order across all outbound requests.
 
+### Third-Party Agent & Harness Integration (`pi-bansos` / `omp` / `pi`)
+
+If you use third-party coding agent harnesses such as **[omp](https://github.com/earendil-works/omp)** or **[pi](https://pi.dev)** with the `pi-bansos` extension, the proxy provides a native pass-through relay endpoint supporting the `x-relay-target` / `x-relay-path` header specification.
+
+Requests forwarded from the harness retain full client fingerprinting and session affinity, while routing through Cloudflare WARP and automatically rotating egress IPs whenever HTTP 429 rate limits occur.
+
+#### Setup via `pi-bansos-relay-state.json`
+
+Add or update your agent state file (`~/.omp/agent/pi-bansos-relay-state.json` or `~/.pi/agent/pi-bansos-relay-state.json`):
+
+```json
+{
+  "enabled": true,
+  "url": "http://127.0.0.1:8000",
+  "relays": [
+    {
+      "url": "http://127.0.0.1:8000",
+      "label": "Local WARP Rotator"
+    }
+  ],
+  "statusBar": "shown"
+}
+```
+
+Alternatively, configure it live inside the TUI without restarts:
+```text
+/bansos url http://127.0.0.1:8000
+/bansos on
+```
 ---
 
 ## API Endpoints Reference
@@ -197,6 +226,7 @@ The proxy pool rotates in round-robin order across all outbound requests.
 | `/dashboard` | `GET` | Renders the HTML Web Management Dashboard. |
 | `/metrics` | `GET` | Returns structured JSON metrics including verified IP, uptime, and request counters. |
 | `/api/rotate` | `POST` | Triggers an immediate manual IP rotation cycle. |
+| `/` or `/relay` | `POST` / `GET` | Pass-through relay for harnesses using `x-relay-target` and `x-relay-path` headers. |
 
 ---
 

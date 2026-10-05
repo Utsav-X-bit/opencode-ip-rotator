@@ -96,6 +96,15 @@ def get_next_outbound_proxy() -> Optional[Dict[str, str]]:
         custom_proxy = os.environ.get("CUSTOM_OUTBOUND_PROXY", "").strip()
         if custom_proxy:
             return {"http": custom_proxy, "https": custom_proxy}
+        if not Path("/.dockerenv").exists():
+            import socket
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(0.3)
+                    if s.connect_ex(("127.0.0.1", 40000)) == 0:
+                        return {"http": "socks5://127.0.0.1:40000", "https": "socks5://127.0.0.1:40000"}
+            except Exception:
+                pass
 
 # -----------------------------------------------------------------------------
 # SQLite — WAL mode + retry for concurrent safety
@@ -458,11 +467,12 @@ metrics = {
 }
 
 DEFAULT_FREE_MODELS = [
+    {"id": "space-bunny-free", "name": "Space Bunny Free"},
+    {"id": "mimo-v2.6-flash-free", "name": "MiMo V2.6 Flash Free"},
     {"id": "deepseek-v4-flash-free", "name": "DeepSeek V4 Flash Free"},
     {"id": "mimo-v2.5-free", "name": "MiMo V2.5 Free"},
-    {"id": "qwen3.6-plus-free", "name": "Qwen 3.6 Plus Free"},
-    {"id": "minimax-m3-free", "name": "MiniMax M3 Free"},
-    {"id": "nemotron-3-ultra-free", "name": "Nemotron 3 Ultra Free"},
+    {"id": "nemotron-3.5-lightning-free", "name": "Nemotron 3.5 Lightning Free"},
+    {"id": "ling-3.1-flash-free", "name": "Ling 3.1 Flash Free"},
 ]
 
 discovered_models: List[Dict[str, str]] = DEFAULT_FREE_MODELS.copy()
@@ -552,19 +562,27 @@ class ChatMessage(BaseModel):
     content: str
 
 class ChatCompletionRequest(BaseModel):
-    model: str = Field(default="deepseek-v4-flash-free")
+    model: str = Field(default="space-bunny-free")
     messages: List[ChatMessage]
     stream: Optional[bool] = False
     temperature: Optional[float] = 0.7
     max_tokens: Optional[int] = None
 
-def get_realistic_headers() -> Dict[str, str]:
-    return {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer public",
-        "Accept": "application/json, text/event-stream, */*",
-        "User-Agent": "OpenCode-IP-Rotator/1.0",
+DEFAULT_USER_AGENT = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"
+
+def get_realistic_headers(raw_request: Optional[Request] = None) -> Dict[str, str]:
+    headers = {
+        "content-type": "application/json",
+        "authorization": "Bearer public",
+        "accept": "application/json, text/event-stream, */*",
+        "user-agent": DEFAULT_USER_AGENT,
     }
+    if raw_request:
+        for k, v in raw_request.headers.items():
+            kl = k.lower()
+            if kl in ("user-agent", "authorization", "accept", "accept-encoding") or kl.startswith("x-opencode-") or kl.startswith("anthropic-"):
+                headers[kl] = v
+    return headers
 
 
 SAFE_UPSTREAM_HEADERS = {
@@ -626,6 +644,13 @@ def upstream_rate_limit_response(response, model_name: str) -> JSONResponse:
     )
     return JSONResponse(status_code=429, content=payload, headers=headers)
 
+
+def format_upstream_error_response(response, model_name: str) -> JSONResponse:
+    try:
+        content = response.json()
+    except Exception:
+        content = {"error": {"message": response.text or "Upstream error", "code": response.status_code, "model": model_name}}
+    return JSONResponse(status_code=response.status_code, content=content)
 
 def rotate_egress(reason: str) -> tuple[bool, Optional[str]]:
     """Request rotation from the service that owns the shared WARP namespace."""
@@ -704,10 +729,11 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
                 raise EmptyStreamError("Upstream returned empty response stream")
 
         # Yield buffered initial lines
+        # Yield buffered initial lines with proper SSE event delimiters
         for b_line in buffered_lines:
             chunk_count += 1
-            yield b_line + b"\n"
-
+            if b_line:
+                yield b_line + b"\n\n"
         # Step 2: Continue streaming remaining lines
         while True:
             item = await loop.run_in_executor(None, get_next_line, line_iter)
@@ -899,10 +925,7 @@ async def chat_completions(raw_request: Request):
     is_stream = payload.get("stream", False)
     log.info(f"Received request for model '{current_model}' (Stream: {is_stream} | Has Tools: {'tools' in payload})")
 
-    headers = get_realistic_headers()
-    for k, v in raw_request.headers.items():
-        if k.lower().startswith("x-opencode-"):
-            headers[k] = v
+    headers = get_realistic_headers(raw_request)
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         try:
@@ -921,16 +944,28 @@ async def chat_completions(raw_request: Request):
             log_upstream_response(response, current_model, "chat_completions", attempt, proxies is not None)
 
             if response.status_code == 429:
+                category, retry_seconds, err_payload = classify_upstream_429(response)
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=current_model).inc()
+                if category == "rate_limit" or attempt < MAX_RETRIES_ON_429:
+                    log.warning("Upstream 429 rate limit hit for '%s' (Attempt %s/%s). Rotating WARP IP...", current_model, attempt, MAX_RETRIES_ON_429)
+                    rotated, verified_ip = await asyncio.to_thread(rotate_egress, f"429 rate limit on {current_model}")
+                    if rotated:
+                        swap_warp_registration()
+                        await asyncio.sleep(1)
+                        continue
                 return upstream_rate_limit_response(response, current_model)
 
             if response.status_code >= 500:
-                delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
-                log.warning("Upstream HTTP %s for '%s'; retrying without egress rotation in %.2fs.", response.status_code, current_model, delay)
-                await asyncio.sleep(delay)
-                continue
+                if attempt < 2:
+                    delay = min(INITIAL_BACKOFF, 1.0)
+                    log.warning("Upstream HTTP %s for '%s'; retrying in %.2fs.", response.status_code, current_model, delay)
+                    await asyncio.sleep(delay)
+                    continue
+                return format_upstream_error_response(response, current_model)
 
+            if response.status_code != 200:
+                return format_upstream_error_response(response, current_model)
             metrics["successful_requests"] += 1
             prom_requests_success.labels(model=current_model).inc()
             prom_request_duration.labels(model=current_model, endpoint="chat_completions").observe(time.time() - start_time)
@@ -1012,13 +1047,8 @@ async def anthropic_messages(raw_request: Request):
         if auth.startswith("Bearer "):
             client_api_key = auth[7:]
 
-    headers = get_realistic_headers()
+    headers = get_realistic_headers(raw_request)
     headers["x-api-key"] = client_api_key or "public"
-
-    for k, v in raw_request.headers.items():
-        kl = k.lower()
-        if kl.startswith("x-opencode-") or kl.startswith("anthropic-"):
-            headers[k] = v
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         try:
@@ -1037,16 +1067,28 @@ async def anthropic_messages(raw_request: Request):
             log_upstream_response(response, model_name, "messages", attempt, proxies is not None)
 
             if response.status_code == 429:
+                category, retry_seconds, err_payload = classify_upstream_429(response)
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=model_name).inc()
+                if category == "rate_limit" or attempt < MAX_RETRIES_ON_429:
+                    log.warning("Upstream 429 rate limit hit for '%s' (Attempt %s/%s). Rotating WARP IP...", model_name, attempt, MAX_RETRIES_ON_429)
+                    rotated, verified_ip = await asyncio.to_thread(rotate_egress, f"429 rate limit on {model_name}")
+                    if rotated:
+                        swap_warp_registration()
+                        await asyncio.sleep(1)
+                        continue
                 return upstream_rate_limit_response(response, model_name)
 
             if response.status_code >= 500:
-                delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
-                log.warning("Upstream HTTP %s for '%s'; retrying without egress rotation in %.2fs.", response.status_code, model_name, delay)
-                await asyncio.sleep(delay)
-                continue
+                if attempt < 2:
+                    delay = min(INITIAL_BACKOFF, 1.0)
+                    log.warning("Upstream HTTP %s for '%s'; retrying in %.2fs.", response.status_code, model_name, delay)
+                    await asyncio.sleep(delay)
+                    continue
+                return format_upstream_error_response(response, model_name)
 
+            if response.status_code != 200:
+                return format_upstream_error_response(response, model_name)
             metrics["successful_requests"] += 1
             prom_requests_success.labels(model=model_name).inc()
             prom_request_duration.labels(model=model_name, endpoint="anthropic_messages").observe(time.time() - start_time)
@@ -1101,10 +1143,7 @@ async def responses_endpoint(raw_request: Request):
     is_stream = body.get("stream", False)
     log.info(f"Received Responses API request for model '{model_name}' (Stream: {is_stream})")
 
-    headers = get_realistic_headers()
-    for k, v in raw_request.headers.items():
-        if k.lower().startswith("x-opencode-"):
-            headers[k] = v
+    headers = get_realistic_headers(raw_request)
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         try:
@@ -1123,16 +1162,29 @@ async def responses_endpoint(raw_request: Request):
             log_upstream_response(response, model_name, "responses", attempt, proxies is not None)
 
             if response.status_code == 429:
+                category, retry_seconds, err_payload = classify_upstream_429(response)
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=model_name).inc()
+                if category == "rate_limit" or attempt < MAX_RETRIES_ON_429:
+                    log.warning("Upstream 429 rate limit hit for '%s' (Attempt %s/%s). Rotating WARP IP...", model_name, attempt, MAX_RETRIES_ON_429)
+                    rotated, verified_ip = await asyncio.to_thread(rotate_egress, f"429 rate limit on {model_name}")
+                    if rotated:
+                        swap_warp_registration()
+                        await asyncio.sleep(1)
+                        continue
                 return upstream_rate_limit_response(response, model_name)
 
             if response.status_code >= 500:
-                delay = compute_backoff_delay(attempt, INITIAL_BACKOFF)
-                log.warning("Upstream HTTP %s for '%s'; retrying without egress rotation in %.2fs.", response.status_code, model_name, delay)
-                await asyncio.sleep(delay)
-                continue
+                if attempt < 2:
+                    delay = min(INITIAL_BACKOFF, 1.0)
+                    log.warning("Upstream HTTP %s for '%s'; retrying in %.2fs.", response.status_code, model_name, delay)
+                    await asyncio.sleep(delay)
+                    continue
+                return format_upstream_error_response(response, model_name)
 
+            if response.status_code != 200:
+                log.warning("Responses endpoint upstream error [%s]: %s", response.status_code, response.text)
+                return format_upstream_error_response(response, model_name)
             metrics["successful_requests"] += 1
             prom_requests_success.labels(model=model_name).inc()
             prom_request_duration.labels(model=model_name, endpoint="responses").observe(time.time() - start_time)
@@ -1164,6 +1216,95 @@ async def responses_endpoint(raw_request: Request):
         headers={"Retry-After": "10"}
     )
 
+# -----------------------------------------------------------------------------
+# Pi-Bansos Relay Endpoint
+# -----------------------------------------------------------------------------
+@app.api_route("/", methods=["GET", "POST", "OPTIONS"])
+@app.api_route("/relay", methods=["GET", "POST", "OPTIONS"])
+async def relay_handler(raw_request: Request):
+    target = raw_request.headers.get("x-relay-target")
+    if not target:
+        return JSONResponse({"status": "healthy", "service": "opencode-ip-rotator"})
+
+    relay_path = raw_request.headers.get("x-relay-path") or "/"
+    target_url = f"{target.rstrip('/')}{relay_path}"
+
+    body_bytes = await raw_request.body()
+
+    headers = {}
+    for k, v in raw_request.headers.items():
+        kl = k.lower()
+        if kl not in ("x-relay-target", "x-relay-path", "host", "content-length"):
+            headers[k] = v
+
+    is_stream = "text/event-stream" in headers.get("accept", "") or b'"stream":true' in body_bytes or b'"stream": true' in body_bytes
+    model_name = "relay"
+    try:
+        body_json = json.loads(body_bytes.decode())
+        model_name = body_json.get("model", "relay")
+    except Exception:
+        pass
+
+    metrics["total_requests"] += 1
+    log.info(f"Relaying {raw_request.method} to {target_url} (model={model_name}, stream={is_stream})")
+
+    for attempt in range(1, MAX_RETRIES_ON_429 + 1):
+        try:
+            proxies = get_next_outbound_proxy()
+            session = create_fresh_session(is_stream) if is_stream else _get_session("relay")
+            response = session.request(
+                method=raw_request.method,
+                url=target_url,
+                data=body_bytes if body_bytes else None,
+                headers=headers,
+                proxies=proxies,
+                impersonate="chrome124",
+                stream=is_stream,
+                timeout=STREAM_TIMEOUT if is_stream else 120,
+            )
+            log_upstream_response(response, model_name, "relay", attempt, proxies is not None)
+
+            if response.status_code == 429:
+                category, retry_seconds, err_payload = classify_upstream_429(response)
+                metrics["rate_limited_requests"] += 1
+                prom_requests_rate_limited.labels(model=model_name).inc()
+                log.warning("Relay 429 rate limit hit for '%s'. Rotating WARP IP...", model_name)
+                rotated, verified_ip = await asyncio.to_thread(rotate_egress, f"Relay 429 rate limit on {model_name}")
+                if rotated:
+                    swap_warp_registration()
+                    await asyncio.sleep(1)
+                    continue
+                return upstream_rate_limit_response(response, model_name)
+
+            if response.status_code >= 500:
+                if attempt < 2:
+                    delay = min(INITIAL_BACKOFF, 1.0)
+                    log.warning("Relay upstream HTTP %s; retrying in %.2fs.", response.status_code, delay)
+                    await asyncio.sleep(delay)
+                    continue
+                return format_upstream_error_response(response, model_name)
+
+            if response.status_code != 200:
+                return format_upstream_error_response(response, model_name)
+
+            metrics["successful_requests"] += 1
+            if is_stream:
+                return StreamingResponse(
+                    stream_response(response, model_name, session=session),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                )
+            else:
+                ct = response.headers.get("content-type", "application/json")
+                return Response(content=response.content, status_code=response.status_code, media_type=ct)
+
+        except Exception as e:
+            log.error(f"[Relay Attempt {attempt}/{MAX_RETRIES_ON_429}] Error: {type(e).__name__}: {e}")
+            if attempt < MAX_RETRIES_ON_429:
+                await asyncio.sleep(min(2 ** attempt, BACKOFF_CAP))
+            continue
+
+    return JSONResponse(status_code=503, content={"error": {"message": "Relay upstream unavailable", "code": 503}})
 # Global exception handler for standard error format
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
