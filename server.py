@@ -69,25 +69,40 @@ PROXY_FILE = Path(os.environ.get("PROXY_LIST_FILE", str(DEFAULT_DATA_DIR / "prox
 _proxy_pool: List[str] = []
 _proxy_index = 0
 _proxy_lock = threading.Lock()
+_last_proxy_mtime: float = 0.0
 
-def load_proxy_list():
-    global _proxy_pool
-    proxies = []
-    if PROXY_FILE.exists():
-        try:
-            with open(PROXY_FILE, "r", encoding="utf-8") as f:
-                lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-                proxies.extend(lines)
-        except Exception as e:
-            log.error(f"Error reading proxies.txt: {e}")
-    env_proxies = os.environ.get("PROXY_LIST", "").strip()
-    if env_proxies:
-        proxies.extend([p.strip() for p in env_proxies.split(",") if p.strip()])
-    _proxy_pool = list(dict.fromkeys(proxies))
-    if _proxy_pool:
-        log.info(f"Loaded {len(_proxy_pool)} custom proxies into pool.")
-
+def load_proxy_list(force: bool = False):
+    global _proxy_pool, _last_proxy_mtime
+    with _proxy_lock:
+        if PROXY_FILE.exists():
+            try:
+                mtime = PROXY_FILE.stat().st_mtime
+                if not force and mtime == _last_proxy_mtime and _proxy_pool:
+                    return
+                _last_proxy_mtime = mtime
+                lines = []
+                with open(PROXY_FILE, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            if "://" not in line:
+                                line = f"http://{line}"
+                            lines.append(line)
+                env_proxies = os.environ.get("PROXY_LIST", "").strip()
+                if env_proxies:
+                    for p in env_proxies.split(","):
+                        p = p.strip()
+                        if p:
+                            if "://" not in p:
+                                p = f"http://{p}"
+                            lines.append(p)
+                _proxy_pool = list(dict.fromkeys(lines))
+                if _proxy_pool:
+                    log.info(f"Loaded {len(_proxy_pool)} custom proxies into pool.")
+            except Exception as e:
+                log.error(f"Error reading proxies.txt: {e}")
 def get_next_outbound_proxy() -> Optional[Dict[str, str]]:
+    load_proxy_list()
     global _proxy_index
     with _proxy_lock:
         if _proxy_pool:

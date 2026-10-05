@@ -33,38 +33,59 @@ PROXY_LIST_ENV = os.environ.get("PROXY_LIST", "").strip()
 _proxy_pool: List[str] = []
 _proxy_index = 0
 _proxy_lock = threading.Lock()
+_last_proxy_mtime: float = 0.0
 
-def load_proxy_list() -> None:
-    """Load proxy list from file and environment variable."""
-    global _proxy_pool, _proxy_index
-    proxies = []
-    
-    # Load from file
-    proxy_file = Path(PROXY_LIST_FILE)
-    if proxy_file.exists():
-        try:
-            with open(proxy_file, "r", encoding="utf-8") as f:
-                lines = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-                proxies.extend(lines)
-        except Exception as e:
-            log.error(f"Error reading proxy list file {PROXY_LIST_FILE}: {e}")
-    
-    # Load from environment variable
-    if PROXY_LIST_ENV:
-        proxies.extend([p.strip() for p in PROXY_LIST_ENV.split(",") if p.strip()])
-    
-    # Deduplicate while preserving order
-    _proxy_pool = list(dict.fromkeys(proxies))
-    _proxy_index = 0
-    
-    if _proxy_pool:
-        log.info(f"Loaded {len(_proxy_pool)} proxies into rotation pool.")
-    else:
-        log.info("No proxies configured. WARP rotation will be the only IP rotation method.")
-
+def load_proxy_list(force: bool = False) -> None:
+    """Load proxy list from file and environment variable with hot-reloading."""
+    global _proxy_pool, _proxy_index, _last_proxy_mtime
+    with _proxy_lock:
+        proxy_file = Path(PROXY_LIST_FILE)
+        if proxy_file.exists():
+            try:
+                mtime = proxy_file.stat().st_mtime
+                if not force and mtime == _last_proxy_mtime and _proxy_pool:
+                    return
+                _last_proxy_mtime = mtime
+                lines = []
+                with open(proxy_file, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            if "://" not in line:
+                                line = f"http://{line}"
+                            lines.append(line)
+                if PROXY_LIST_ENV:
+                    for p in PROXY_LIST_ENV.split(","):
+                        p = p.strip()
+                        if p:
+                            if "://" not in p:
+                                p = f"http://{p}"
+                            lines.append(p)
+                _proxy_pool = list(dict.fromkeys(lines))
+                _proxy_index = 0
+                if _proxy_pool:
+                    log.info(f"Loaded {len(_proxy_pool)} proxies into rotation pool.")
+            except Exception as e:
+                log.error(f"Error reading proxy list file {PROXY_LIST_FILE}: {e}")
+        elif PROXY_LIST_ENV:
+            lines = []
+            for p in PROXY_LIST_ENV.split(","):
+                p = p.strip()
+                if p:
+                    if "://" not in p:
+                        p = f"http://{p}"
+                    lines.append(p)
+            _proxy_pool = list(dict.fromkeys(lines))
+            _proxy_index = 0
+            if _proxy_pool:
+                log.info(f"Loaded {len(_proxy_pool)} proxies into rotation pool.")
+        else:
+            _proxy_pool = []
+            _proxy_index = 0
 def get_next_proxy() -> Optional[Dict[str, str]]:
     """Get the next proxy from the pool in round-robin fashion."""
     global _proxy_index
+    load_proxy_list()
     with _proxy_lock:
         if not _proxy_pool:
             return None
@@ -146,6 +167,12 @@ def get_effective_outbound_proxy() -> Optional[Dict[str, str]]:
 
 def get_public_ip() -> Optional[str]:
     """Fetches current public IP using Chrome TLS impersonation."""
+    load_proxy_list()
+    with _proxy_lock:
+        if _proxy_pool:
+            idx = max(0, _proxy_index - 1) % len(_proxy_pool)
+            p_url = _proxy_pool[idx]
+            return get_public_ip_via_proxy({"http": p_url, "https": p_url})
     proxy = get_effective_outbound_proxy()
     if proxy:
         return get_public_ip_via_proxy(proxy)
@@ -254,6 +281,45 @@ def rotate_warp(reason: str = "Triggered") -> bool:
             log.info(f"Initiating guaranteed IP rotation... (Reason: {reason} | Current IP: {old_ip})")
 
             # Try local WARP CLI rotation first
+            # Priority 1: If proxies are loaded in proxy pool, rotate through them
+            load_proxy_list()
+            proxy = get_next_proxy()
+            if proxy:
+                log.info(f"Rotating to next proxy from pool... (Reason: {reason})")
+                for _ in range(min(5, len(_proxy_pool))):
+                    new_ip = get_public_ip_via_proxy(proxy)
+                    if new_ip:
+                        _current_ip = new_ip
+                        rotation_count += 1
+                        loc = get_ip_location(new_ip)
+                        timestamp_str = time.strftime("%H:%M:%S", time.localtime())
+                        ip_history.append({
+                            "ip": new_ip,
+                            "country": loc.get("country", "Unknown"),
+                            "flag": loc.get("flag", "🌐"),
+                            "timestamp": timestamp_str,
+                            "reason": reason
+                        })
+                        if len(ip_history) > 20:
+                            ip_history.pop(0)
+                        try:
+                            if FLOW_LEASE_DB_PATH.exists():
+                                conn = sqlite3.connect(str(FLOW_LEASE_DB_PATH))
+                                conn.execute(
+                                    "INSERT INTO ip_history (ip, country, flag, timestamp, reason) VALUES (?, ?, ?, ?, ?)",
+                                    (new_ip, loc.get("country", "Unknown"), loc.get("flag", "🌐"), timestamp_str, reason)
+                                )
+                                conn.commit()
+                                conn.close()
+                        except Exception as err:
+                            log.error(f"Failed to write IP rotation to SQLite DB: {err}")
+                        log.info(f"Proxy pool IP rotation successful! New Verified IP: {new_ip} {loc.get('flag')} ({loc.get('country')}) (Total Rotations: {rotation_count})")
+                        return True
+                    proxy = get_next_proxy()
+                    if not proxy:
+                        break
+
+            # Priority 2: Cloudflare WARP rotation
             warp_bin = get_warp_bin()
             if shutil.which(warp_bin) or os.path.exists(warp_bin):
                 max_attempts = 2
