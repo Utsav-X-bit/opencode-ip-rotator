@@ -286,9 +286,10 @@ def rotate_warp(reason: str = "Triggered") -> bool:
             proxy = get_next_proxy()
             if proxy:
                 log.info(f"Rotating to next proxy from pool... (Reason: {reason})")
-                for _ in range(min(5, len(_proxy_pool))):
+                candidates_to_try = max(5, len(_proxy_pool) * 2)
+                for _ in range(candidates_to_try):
                     new_ip = get_public_ip_via_proxy(proxy)
-                    if new_ip:
+                    if new_ip and (new_ip != old_ip or len(_proxy_pool) <= 1):
                         _current_ip = new_ip
                         rotation_count += 1
                         loc = get_ip_location(new_ip)
