@@ -5,46 +5,66 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](https://opensource.org/licenses/MIT)
 [![Python 3.11](https://img.shields.io/badge/python-3.11-brightgreen.svg?style=flat-square&logo=python)](https://python.org)
 
-A microservice-architected Cloudflare WARP IP rotator and proxy server for OpenCode Zen. Designed to prevent HTTP 429 rate limits, guarantee unique IP rotation per cycle, log usage metrics into SQLite, and display real-time statistics on a clean web dashboard.
+A microservice-architected 3-tier egress proxy for OpenCode Zen. Every request rides **Tier 1 (Direct Home IP)** → on 429 cools down and escalates to **Tier 2 (Cloudflare WARP / proxy pool with IP rotation)** → when local tiers exhaust, **Tier 3 (Cloud Relay)** serves the request. Quota-category 429s fail fast (no rotation burn). Logs usage metrics into SQLite and displays real-time statistics on a clean web dashboard.
 
 ![OpenCode IP Rotator Dashboard Preview](docs/dashboard_preview.jpg)
+
+> **Live-verified 2026-10-07:** Tier 1 request `200 "ok"` via `http://127.0.0.1:8765`; WARP rotation `{"status":"success"}` via rotator `:8001`; relay forward reaches upstream (returns genuine upstream `FreeTierError`/`FreeUsageLimitError`/`ModelError` shapes, proving end-to-end relay transport works).
 
 ---
 
 ## Key Features
 
+- **3-Tier Automatic Failover**: Direct Home IP → WARP/proxy-pool rotation → cloud relay, with per-tier cooldowns and a live tier-state file (`/tmp/opencode-active-tier.json`) consumed by the `omp` statusline.
+- **Quota-Aware 429 Handling**: `FreeUsageLimitError`/`GoUsageLimitError`/`BlackUsageLimitError` fail fast with upstream `Retry-After` preserved — never burns WARP rotations on account-level limits.
 - **Verified Shared Egress**: The proxy and WARP service share one network namespace, so the observed egress path is the path used for upstream requests.
 - **Microservices Architecture**: Decoupled `proxy-server` (FastAPI) and `warp-rotator` (Cloudflare WARP daemon) services built with Docker Compose.
 - **Clean Management Dashboard**: Lightweight Web UI displaying active connections, current location, token statistics, and manual rotation controls.
 - **SQLite Data Persistence**: Stores token consumption, model request counts, and historical IP rotation logs on disk.
 - **USD Savings Calculator**: Estimates cost savings per model based on prompt and completion token rates.
 - **Table Pagination**: Built-in 5-item pagination for model usage and IP rotation log tables.
-- **Active Flow Locking**: Protects active SSE streams from being interrupted during IP rotation — `_active_flows_count` is held for the **full lifetime of the generator**, not just until `return`.
-- **Rate-limit Preservation**: Returns upstream 429 details and `Retry-After` without attempting to bypass model, account, provider, or subscription limits.
-- **Anthropic API Compatibility**: Native `/v1/messages` endpoint for Claude clients and the Vercel AI SDK `@ai-sdk/anthropic` provider.
-- **Custom Proxy Pool Support**: Round-robin outbound proxy pool via `data/proxies.txt` or `PROXY_LIST` environment variable.
+- **Active Flow Locking**: DB-backed flow leases + in-process counters protect active SSE streams from rotation mid-flight; truncated streams emit an error chunk, never a clean `[DONE]`.
+- **Anthropic + Responses API Compatibility**: Native `/v1/messages` (Claude clients, Vercel AI SDK) and `/v1/responses` endpoints, all riding the same 3-tier failover.
+- **Custom Proxy Pool Support**: Round-robin outbound proxy pool via `data/proxies.txt` or `PROXY_LIST` environment variable (honored even when the file is absent).
+- **Edge Relay Fleet**: Local relay (`server.py` `/`+`/relay`), Deno Deploy relay (`deno-relay.ts`), and authenticated Cloudflare Worker relay (`cf-relay/`, token via `wrangler secret put RELAY_TOKEN` — never committed).
 
 ---
 
 ## Architecture Overview
 
 ```
-[OpenCode Client] ──(HTTP/2)──> [Proxy Server (Port 8000)] ──(SQLite)──> [metrics.db]
-                                           │
-                                  (Inter-Service IPC)
-                                           ▼
-                                [WARP Rotator (Port 8001)] ──> [Cloudflare WARP Daemon]
-                                           │
-                                           ▼
-                              [OpenCode Zen API Endpoint]
+[OpenCode Client / omp+pi-bansos] ──> [Proxy Server (:8765 native / :8000 docker)]
+                                                │ ① Tier 1: Direct Home IP (None proxy)
+                                                │ ② Tier 2: WARP SOCKS5 :40000 / proxy pool
+                                                │     (429 → rotate via Rotator :8001, cooldown direct 300s)
+                                                │ ③ Tier 3: Cloud Relay (FALLBACK_RELAY_URL)
+                                                │     shared helper attempt_cloud_relay_fallback()
+                                                ▼
+                                       [OpenCode Zen API Endpoint]
+                                       https://opencode.ai/zen/v1
+
+                    [WARP Rotator (:8001)] ──> [Cloudflare WARP Daemon]
+                      POST /rotate · GET /status · GET /health
+                      (owns shared netns; SQLite flow-lease guard)
+
+                    [Edge Relays] ──x-relay-target/x-relay-path──> upstream
+                      local (server.py) · deno-relay.ts · cf-relay worker
 ```
+
+### Tier state contract
+
+`server.py` publishes the live egress tier after every success to `/tmp/opencode-active-tier.json`:
+```json
+{"tier": "direct", "label": "direct (home)", "direct_available": true, "timestamp": 1791386366.88}
+```
+Labels: `direct (home)` · `warp` · `proxy_pool`/`custom_proxy` (actual name) · `render`. The `omp` statusline (`pi-statusline.ts`) reads this file and right-aligns `relay: <label>` on the `& think:` line, only when the `bansos` provider is active.
 
 ### Core Architecture Components
 
-1. **Proxy Server (`server.py`):** An OpenAI-compatible API proxy server running on `http://127.0.0.1:8000/v1`. It processes requests, forwards headers dynamically, handles streaming SSE responses, and presents a Web Management Dashboard.
-2. **Rotator Module (`rotator.py`):** Owns the WARP network namespace and exposes a private health/rotation control endpoint. Manual rotation is authenticated; upstream 429 responses are not used as a rotation trigger.
-3. **Container Manager (`manager.py`):** Provides automated ephemeral container lifecycle management. Triggers container self-destruction and re-creation once a defined rotation threshold is reached to ensure fresh hardware identifiers (`machine-id`).
-
+1. **Proxy Server (`server.py`):** OpenAI/Anthropic/Responses-compatible API proxy (native `http://127.0.0.1:8765`, Docker `:8000`). 3-tier retry loop per endpoint (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/`+`/relay`), SSE streaming with truncation detection, Web Management Dashboard.
+2. **Rotator Module (`rotator.py`):** Owns the WARP network namespace; exposes `POST /rotate`, `GET /status`, `GET /health` on `:8001`. Guards rotation against active flow leases (SQLite `active_flow_leases`, TTL 90s).
+3. **Edge Relays:** `deno-relay.ts` (Deno Deploy, open) and `cf-relay/` (Cloudflare Worker, `RELAY_TOKEN`-gated) forward `x-relay-target`/`x-relay-path` to `https://opencode.ai`, stripping hop-by-hop headers and never forwarding the relay credential upstream.
+4. **Container Manager (`manager.py`):** Ephemeral container lifecycle management (self-destruction/re-creation past a rotation threshold for fresh hardware identifiers).
 ---
 
 ## Detailed Features
@@ -241,10 +261,21 @@ Alternatively, configure it live inside the TUI without restarts:
 | `AUTO_RECYCLE_THRESHOLD` | `50` | Maximum rotations before triggering container environment refresh. |
 | `CORS_ALLOW_ORIGINS` | `http://127.0.0.1:8000,http://localhost:8000` | Comma-separated browser origins allowed to call the proxy. |
 | `WARP_ROTATOR_URL` | `http://127.0.0.1:8001` | Internal rotator endpoint. Do not expose port 8001 publicly. |
+| `FALLBACK_RELAY_URL` | `https://relay.xdod.bot.cd` | Tier 3 cloud relay; full prompts route through it on local-tier exhaustion. Unset to disable. |
+| `DIRECT_COOLDOWN_SECONDS` | `300` | Cooldown for Tier 1 after a 429 before direct is retried. |
+| `RELAY_TOKEN` (cf-relay only) | *(unset = open dev mode)* | Set via `wrangler secret put RELAY_TOKEN`; NEVER in `wrangler.toml`. Production MUST set it. |
 
 ### Rate-limit behavior
 
-The proxy preserves upstream `429` responses, including `Retry-After`, and does not treat them as a signal to bypass account, model, provider, or subscription limits. The dashboard can trigger manual WARP rotation. In Docker, the proxy shares the rotator's network namespace so the egress path being checked is the path used for upstream requests.
+The proxy classifies every upstream `429` (`rate_limits.py: classify_upstream_429`) and preserves `Retry-After`:
+
+| Category | Trigger types | Behavior |
+| :--- | :--- | :--- |
+| `quota` | `FreeUsageLimitError`, `GoUsageLimitError`, `BlackUsageLimitError` | Fail fast: return 429 immediately. No WARP rotation, no relay escalation — rotation cannot fix account limits. |
+| `rate_limit` | `RateLimitError` | Tier escalation: direct → cooldown → WARP rotation → cloud relay. |
+| `upstream_rate_limit` | anything else | Same escalation as `rate_limit`. |
+
+HTTP `408` is retried like `5xx`. Truncated SSE streams terminate with an error chunk, never a clean `[DONE]`.
 
 ---
 

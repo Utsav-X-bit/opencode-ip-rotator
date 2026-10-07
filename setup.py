@@ -37,7 +37,7 @@ def install_dependencies():
         if req_file.exists():
             subprocess.check_call([sys.executable, "-m", "pip", "install", "-r", str(req_file)])
         else:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "fastapi", "uvicorn", "pydantic"])
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "fastapi", "uvicorn", "pydantic", "curl_cffi", "jinja2", "prometheus-client"])
         log("Dependencies installed successfully.")
     except Exception as e:
         log(f"Failed to install dependencies: {e}", "ERROR")

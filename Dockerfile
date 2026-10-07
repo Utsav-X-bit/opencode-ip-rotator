@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install FastAPI and Uvicorn for zen_server
-RUN pip3 install fastapi uvicorn pydantic
+RUN pip3 install fastapi uvicorn pydantic curl_cffi jinja2 prometheus-client
 
 # Add Cloudflare WARP repository & install warp-cli
 RUN curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg \

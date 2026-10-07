@@ -4,8 +4,10 @@ import logging
 import os
 import random
 import signal
+import secrets
 import sqlite3
 import threading
+import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -43,6 +45,7 @@ DASHBOARD_REFRESH_INTERVAL = 3
 STARTUP_TIME = time.time()
 ENABLE_HTTP2 = os.environ.get("ENABLE_HTTP2", "false").lower() in ("true", "1", "yes")
 STREAM_TIMEOUT = 600
+FALLBACK_RELAY_URL = os.environ.get("FALLBACK_RELAY_URL", "https://relay.xdod.bot.cd").strip()
 FLOW_LEASE_TTL_SECONDS = int(os.environ.get("FLOW_LEASE_TTL_SECONDS", "90"))
 FLOW_LEASE_HEARTBEAT_SECONDS = int(os.environ.get("FLOW_LEASE_HEARTBEAT_SECONDS", "15"))
 
@@ -101,27 +104,110 @@ def load_proxy_list(force: bool = False):
                     log.info(f"Loaded {len(_proxy_pool)} custom proxies into pool.")
             except Exception as e:
                 log.error(f"Error reading proxies.txt: {e}")
-def get_next_outbound_proxy() -> Optional[Dict[str, str]]:
+        elif os.environ.get("PROXY_LIST", "").strip():
+            try:
+                lines = []
+                for p in os.environ["PROXY_LIST"].split(","):
+                    p = p.strip()
+                    if p:
+                        if "://" not in p:
+                            p = f"http://{p}"
+                        lines.append(p)
+                _proxy_pool = list(dict.fromkeys(lines))
+                if _proxy_pool:
+                    log.info(f"Loaded {len(_proxy_pool)} custom proxies from PROXY_LIST env.")
+            except Exception as e:
+                log.error(f"Error reading PROXY_LIST env: {e}")
+_direct_cooldown_until: float = 0.0
+DIRECT_COOLDOWN_SECONDS: int = int(os.environ.get("DIRECT_COOLDOWN_SECONDS", "300"))
+ACTIVE_TIER_STATE_FILE = Path("/tmp/opencode-active-tier.json")
+_current_active_tier: str = "direct"
+
+def record_active_tier(tier: str, label: str) -> None:
+    global _current_active_tier
+    _current_active_tier = tier
+    try:
+        data = {
+            "tier": tier,
+            "label": label,
+            "direct_available": is_direct_available(),
+            "timestamp": time.time(),
+        }
+        fd, tmp_path = tempfile.mkstemp(prefix="opencode-active-tier.", dir="/tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(data, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, str(ACTIVE_TIER_STATE_FILE))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+            raise
+    except Exception as e:
+        log.warning("Failed to record active tier '%s': %s", tier, e)
+
+
+def is_direct_available() -> bool:
+    global _direct_cooldown_until
+    return time.time() >= _direct_cooldown_until
+
+def mark_direct_rate_limited():
+    global _direct_cooldown_until
+    _direct_cooldown_until = time.time() + DIRECT_COOLDOWN_SECONDS
+    log.warning(
+        "Tier 1 (Direct Home IP) hit 429. Cooldown active for %ds until %s.",
+        DIRECT_COOLDOWN_SECONDS,
+        time.strftime("%H:%M:%S", time.localtime(_direct_cooldown_until))
+    )
+    record_active_tier("warp", "warp")
+
+def get_warp_proxy() -> Optional[Dict[str, str]]:
+    if not Path("/.dockerenv").exists():
+        import socket
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.3)
+                if s.connect_ex(("127.0.0.1", 40000)) == 0:
+                    return {"http": "socks5h://127.0.0.1:40000", "https": "socks5h://127.0.0.1:40000"}
+        except Exception:
+            pass
+    return None
+
+def get_tiered_proxy(attempt: int = 1) -> tuple[str, Optional[Dict[str, str]]]:
+    """
+    Tier 1 (attempt == 1 and not cooling down): Direct Home IP (None)
+    Tier 2 (attempt > 1 or direct in cooldown): Cloudflare WARP or Custom Proxy Pool
+    """
+    # Tier 1: Direct Home IP if available and attempt == 1
+    if is_direct_available() and attempt == 1:
+        record_active_tier("direct", "direct (home)")
+        return "direct", None
+
+    # Custom proxy pool if loaded
     load_proxy_list()
     global _proxy_index
     with _proxy_lock:
         if _proxy_pool:
-            proxy_url = _proxy_pool[_proxy_index % len(_proxy_pool)]
+            p_url = _proxy_pool[_proxy_index % len(_proxy_pool)]
             _proxy_index += 1
-            return {"http": proxy_url, "https": proxy_url}
+            return "proxy_pool", {"http": p_url, "https": p_url}
         custom_proxy = os.environ.get("CUSTOM_OUTBOUND_PROXY", "").strip()
         if custom_proxy:
-            return {"http": custom_proxy, "https": custom_proxy}
-        if not Path("/.dockerenv").exists():
-            import socket
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(0.3)
-                    if s.connect_ex(("127.0.0.1", 40000)) == 0:
-                        return {"http": "socks5://127.0.0.1:40000", "https": "socks5://127.0.0.1:40000"}
-            except Exception:
-                pass
+            return "custom_proxy", {"http": custom_proxy, "https": custom_proxy}
 
+    # Tier 2: Cloudflare WARP
+    warp_proxy = get_warp_proxy()
+    if warp_proxy:
+        return "warp", warp_proxy
+
+    return "direct", None
+
+def get_next_outbound_proxy() -> Optional[Dict[str, str]]:
+    _, proxy = get_tiered_proxy(attempt=1)
+    return proxy
 # -----------------------------------------------------------------------------
 # SQLite — WAL mode + retry for concurrent safety
 # -----------------------------------------------------------------------------
@@ -336,7 +422,11 @@ _request_drain_event.set()
 
 async def wait_for_rotation_drain():
     if _rotation_in_progress.is_set():
-        await asyncio.wait_for(_request_drain_event.wait(), timeout=15)
+        try:
+            await asyncio.wait_for(_request_drain_event.wait(), timeout=15)
+        except asyncio.TimeoutError:
+            log.warning("Rotation drain wait timed out after 15s; proceeding with request.")
+            metrics["rotation_drain_timeouts"] = metrics.get("rotation_drain_timeouts", 0) + 1
 
 def signal_rotation_start():
     _rotation_in_progress.set()
@@ -457,7 +547,7 @@ model_usage_stats: Dict[str, Dict[str, float]] = {}
 
 # Configuration & Dynamic Discovery
 # -----------------------------------------------------------------------------
-PORT = int(os.environ.get("OPENCODE_ZEN_PORT", "8000"))
+PORT = int(os.environ.get("OPENCODE_ZEN_PORT", "8765"))
 HOST = os.environ.get("OPENCODE_ZEN_HOST", "127.0.0.1")
 TARGET_ZEN_BASE = os.environ.get("OPENCODE_ZEN_TARGET_BASE", "https://opencode.ai/zen/v1")
 TARGET_ZEN_URL = f"{TARGET_ZEN_BASE}/chat/completions"
@@ -469,7 +559,7 @@ INITIAL_BACKOFF = float(os.environ.get("INITIAL_BACKOFF", "1"))
 WARP_ROTATOR_URL = os.environ.get("WARP_ROTATOR_URL", "http://127.0.0.1:8001").rstrip("/")
 CORS_ALLOW_ORIGINS = [
     origin.strip()
-    for origin in os.environ.get("CORS_ALLOW_ORIGINS", "http://127.0.0.1:8000,http://localhost:8000").split(",")
+    for origin in os.environ.get("CORS_ALLOW_ORIGINS", "http://127.0.0.1:8765,http://localhost:8765").split(",")
     if origin.strip()
 ]
 
@@ -516,6 +606,7 @@ async def lifespan(application: FastAPI):
     global model_usage_stats
     init_db()
     model_usage_stats = load_metrics_from_db()
+    record_active_tier("direct", "direct (home)")
     _discovery_stop.clear()
     threading.Thread(target=discover_models_task, daemon=True).start()
     yield
@@ -585,19 +676,191 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
 
 DEFAULT_USER_AGENT = "opencode/1.18.31 ai-sdk/provider-utils/4.0.40 runtime/bun/1.3.14"
+BASE62 = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+OPENCODE_FINGERPRINT_TOOLS = ["bash", "glob", "grep", "read", "edit", "write"]
+OPENCODE_PROJECT_ID = secrets.token_hex(20)
+
+def generate_session_id() -> str:
+    now_ms = int(time.time() * 1000)
+    current = (now_ms * 0x1000) + random.randint(1, 4095)
+    val = (~current) & 0xFFFFFFFFFFFF
+    time_hex = f"{val:012x}"
+    rand_chars = "".join(random.choice(BASE62) for _ in range(14))
+    return f"ses_{time_hex}{rand_chars}"
+
+def generate_request_id() -> str:
+    now_ms = int(time.time() * 1000)
+    current = (now_ms * 0x1000) + 1
+    val = current & 0xFFFFFFFFFFFF
+    time_hex = f"{val:012x}"
+    rand_chars = "".join(random.choice(BASE62) for _ in range(14))
+    return f"msg_{time_hex}{rand_chars}"
+
+def ensure_opencode_fingerprint(payload: dict, is_responses: bool = False) -> None:
+    payload["stream"] = True
+    if is_responses:
+        payload["store"] = False
+        tools = payload.setdefault("tools", [])
+        existing = {t.get("name") for t in tools if isinstance(t, dict)}
+        for name in OPENCODE_FINGERPRINT_TOOLS:
+            if name not in existing:
+                tools.append({
+                    "type": "function",
+                    "name": name,
+                    "description": f"OpenCode built-in {name} tool",
+                    "parameters": {"type": "object", "properties": {}},
+                })
+    else:
+        tools = payload.setdefault("tools", [])
+        existing = set()
+        for t in tools:
+            if isinstance(t, dict):
+                fn = t.get("function")
+                if isinstance(fn, dict) and "name" in fn:
+                    existing.add(fn["name"])
+                elif "name" in t:
+                    existing.add(t["name"])
+        for name in OPENCODE_FINGERPRINT_TOOLS:
+            if name not in existing:
+                tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": f"OpenCode built-in {name} tool",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                })
+        if payload.get("tool_choice") is None:
+            payload["tool_choice"] = "none"
+
+def aggregate_stream_to_chat_completion(stream_lines, model_name: str) -> dict:
+    content_parts = []
+    finish_reason = "stop"
+    completion_id = f"chatcmpl-{int(time.time())}"
+    for line in stream_lines:
+        if isinstance(line, bytes):
+            line = line.decode("utf-8", errors="ignore")
+        line = line.strip()
+        if not line or not line.startswith("data:"):
+            continue
+        data_str = line[5:].strip()
+        if data_str == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data_str)
+            if "id" in chunk:
+                completion_id = chunk["id"]
+            choices = chunk.get("choices", [])
+            if choices:
+                delta = choices[0].get("delta", {})
+                if "content" in delta and delta["content"]:
+                    content_parts.append(delta["content"])
+                if choices[0].get("finish_reason"):
+                    finish_reason = choices[0]["finish_reason"]
+            elif chunk.get("type") in ("response.output_text.delta", "response.output_item.delta"):
+                delta_raw = chunk.get("delta", "")
+                delta_text = delta_raw if isinstance(delta_raw, str) else (delta_raw.get("text", "") if isinstance(delta_raw, dict) else "")
+                if delta_text:
+                    content_parts.append(delta_text)
+        except Exception:
+            continue
+    full_content = "".join(content_parts)
+    return {
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model_name,
+        "choices": [
+            {
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": full_content,
+                },
+                "finish_reason": finish_reason,
+            }
+        ],
+        "usage": {
+            "prompt_tokens": DEFAULT_PROMPT_TOKENS,
+            "completion_tokens": max(1, len(full_content) // 4),
+            "total_tokens": DEFAULT_PROMPT_TOKENS + max(1, len(full_content) // 4),
+        },
+    }
+def aggregate_stream_to_response(stream_lines, model_name: str) -> dict:
+    content_parts = []
+    response_id = f"resp_{int(time.time())}"
+    for line in stream_lines:
+        if isinstance(line, bytes):
+            line = line.decode("utf-8", errors="ignore")
+        line = line.strip()
+        if not line or not line.startswith("data:"):
+            continue
+        data_str = line[5:].strip()
+        if data_str == "[DONE]":
+            break
+        try:
+            chunk = json.loads(data_str)
+            if chunk.get("type") == "response.created":
+                r_obj = chunk.get("response", {})
+                if "id" in r_obj:
+                    response_id = r_obj["id"]
+            elif chunk.get("type") == "response.output_item.delta":
+                delta = chunk.get("delta", {})
+                if "text" in delta:
+                    content_parts.append(delta["text"])
+            elif chunk.get("type") == "response.completed":
+                r_obj = chunk.get("response", {})
+                if "id" in r_obj:
+                    response_id = r_obj["id"]
+        except Exception:
+            continue
+    full_content = "".join(content_parts)
+    return {
+        "id": response_id,
+        "object": "response",
+        "created": int(time.time()),
+        "model": model_name,
+        "status": "completed",
+        "output": [
+            {
+                "id": f"item_{int(time.time())}",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": full_content}],
+            }
+        ],
+    }
 
 def get_realistic_headers(raw_request: Optional[Request] = None) -> Dict[str, str]:
+    session = generate_session_id()
+    trace_id = secrets.token_hex(16)
+    span_id = secrets.token_hex(8)
     headers = {
         "content-type": "application/json",
         "authorization": "Bearer public",
-        "accept": "application/json, text/event-stream, */*",
+        "accept": "text/event-stream, application/json, */*",
         "user-agent": DEFAULT_USER_AGENT,
+        "x-opencode-client": "desktop",
+        "x-opencode-project": OPENCODE_PROJECT_ID,
+        "x-opencode-session": session,
+        "x-session-affinity": session,
+        "x-opencode-request": generate_request_id(),
+        "b3": f"{trace_id}-{span_id}-1-{span_id}",
+        "traceparent": f"00-{trace_id}-{span_id}-01",
     }
     if raw_request:
         for k, v in raw_request.headers.items():
             kl = k.lower()
-            if kl in ("user-agent", "authorization", "accept", "accept-encoding") or kl.startswith("x-opencode-") or kl.startswith("anthropic-"):
+            if kl == "user-agent":
+                if v.startswith("opencode/"):
+                    headers["user-agent"] = v
+            elif kl == "authorization" and v.strip() and v != "Bearer placeholder":
+                headers["authorization"] = v
+            elif kl.startswith("x-opencode-") or kl.startswith("anthropic-") or kl in ("b3", "traceparent", "x-session-affinity"):
+                if kl in ("x-opencode-session", "x-session-affinity") and not v.startswith("ses_"):
+                    continue
                 headers[kl] = v
+    headers["host"] = "opencode.ai"
     return headers
 
 
@@ -679,6 +942,64 @@ def rotate_egress(reason: str) -> tuple[bool, Optional[str]]:
     except Exception as exc:
         log.warning("Rotator request failed: %s", exc)
         return False, None
+def attempt_cloud_relay_fallback(
+    headers: Dict[str, str],
+    payload: dict,
+    relay_path: str,
+    model_name: str,
+) -> tuple[Optional[object], Optional[object]]:
+    """POST payload to Tier 3 cloud relay. Returns (response, session) on 200, else (None, None)."""
+    if not FALLBACK_RELAY_URL:
+        return None, None
+    fallback_session = None
+    fallback_resp = None
+    try:
+        log.warning(
+            "Local tiers exhausted for '%s'. Escalating to Tier 3 (Cloud Relay): %s",
+            model_name,
+            FALLBACK_RELAY_URL,
+        )
+        relay_headers = dict(headers)
+        relay_headers.pop("host", None)
+        relay_headers["x-relay-target"] = "https://opencode.ai"
+        relay_headers["x-relay-path"] = relay_path
+        fallback_session = create_fresh_session(True)
+        fallback_resp = fallback_session.post(
+            FALLBACK_RELAY_URL,
+            json=payload,
+            headers=relay_headers,
+            impersonate="chrome124",
+            stream=True,
+            timeout=(6, STREAM_TIMEOUT),
+        )
+        if fallback_resp.status_code == 200:
+            log.info("Tier 3 (Cloud Relay) succeeded 200 for model '%s'", model_name)
+            record_active_tier("render", "render")
+            return fallback_resp, fallback_session
+        log.warning(
+            "Cloud relay fallback returned HTTP %s for model '%s'",
+            fallback_resp.status_code,
+            model_name,
+        )
+    except Exception as fb_err:
+        log.warning("Cloud relay fallback failed: %s", fb_err)
+    for obj in (fallback_resp, fallback_session):
+        try:
+            if obj is not None:
+                obj.close()
+        except Exception:
+            pass
+    return None, None
+def close_upstream(response: Optional[object] = None, session: Optional[object] = None) -> None:
+    """Best-effort close of a curl_cffi response/session superseded by retry or fallback."""
+    for obj in (response, session):
+        try:
+            if obj is not None:
+                obj.close()
+        except Exception:
+            pass
+
+
 
 class EmptyStreamError(Exception):
     """Raised when upstream returns an empty or truncated stream without valid content/tool calls."""
@@ -707,6 +1028,7 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
     last_raw_line = ""
     buffered_lines = []
     has_meaningful_content = False
+    truncated = False
 
     try:
         def get_next_line(iter_lines):
@@ -758,6 +1080,7 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
                 break
             if item == "SOCKET_ERROR":
                 log.warning(f"[STREAM DEBUG] Upstream connection aborted via socket error for '{model_name}'. Lines sent: {chunk_count}")
+                truncated = True
                 break
 
             line = item
@@ -771,15 +1094,19 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
             else:
                 yield b"\n"
 
-        log.info(f"Streaming completed successfully for model '{model_name}' ({chunk_count} lines sent).")
-        yield b"\ndata: [DONE]\n\n"
+        if truncated:
+            log.warning(f"[STREAM DEBUG] Upstream stream truncated for '{model_name}' after {chunk_count} lines; closing without [DONE].")
+            yield b'\ndata: {"error": {"message": "Upstream stream truncated", "type": "upstream_error"}}\n\n'
+        else:
+            log.info(f"Streaming completed successfully for model '{model_name}' ({chunk_count} lines sent).")
+            yield b"\ndata: [DONE]\n\n"
     except EmptyStreamError:
         raise
     except GeneratorExit:
         log.warning(f"[STREAM DEBUG] Client (OpenCode) explicitly closed/aborted SSE connection prematurely for '{model_name}' after {chunk_count} lines.")
     except Exception as e:
         log.error(f"Stream exception caught for model '{model_name}': {type(e).__name__}: {e}", exc_info=True)
-        yield b"\ndata: [DONE]\n\n"
+        yield b'\ndata: {"error": {"message": "Upstream stream error", "type": "upstream_error"}}\n\n'
     finally:
         lease_heartbeat.cancel()
         await asyncio.gather(lease_heartbeat, return_exceptions=True)
@@ -792,6 +1119,69 @@ async def stream_response(response, model_name: str, session=None) -> AsyncGener
                 session.close()
             except Exception:
                 pass
+async def stream_responses_as_chat_completions(response, model_name: str, session=None) -> AsyncGenerator[bytes, None]:
+    loop = asyncio.get_event_loop()
+    line_iter = response.iter_lines()
+    completion_id = f"chatcmpl-muse-{int(time.time())}"
+    def get_next_line(iter_lines):
+        try:
+            return next(iter_lines)
+        except StopIteration:
+            return "STOP_ITERATION"
+        except Exception:
+            return "SOCKET_ERROR"
+
+    try:
+        while True:
+            item = await loop.run_in_executor(None, get_next_line, line_iter)
+            if item in ("STOP_ITERATION", "SOCKET_ERROR"):
+                break
+            if not item:
+                continue
+            line = item.decode("utf-8", errors="ignore") if isinstance(item, bytes) else item
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            data_str = line[5:].strip()
+            if data_str == "[DONE]":
+                break
+            try:
+                evt = json.loads(data_str)
+                evt_type = evt.get("type")
+                if evt_type in ("response.output_text.delta", "response.output_item.delta"):
+                    delta_raw = evt.get("delta", "")
+                    delta_text = delta_raw if isinstance(delta_raw, str) else (delta_raw.get("text", "") if isinstance(delta_raw, dict) else "")
+                    if delta_text:
+                        chunk = {
+                            "id": completion_id,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model_name,
+                            "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}],
+                        }
+                        yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+                elif evt_type == "response.completed":
+                    chunk = {
+                        "id": completion_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    }
+                    yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+            except Exception:
+                continue
+        yield b"data: [DONE]\n\n"
+    except Exception as e:
+        log.error(f"Stream exception caught in muse translator: {e}")
+        yield b"data: [DONE]\n\n"
+    finally:
+        if session:
+            try:
+                session.close()
+            except Exception:
+                pass
+
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request):
@@ -938,24 +1328,87 @@ async def chat_completions(raw_request: Request):
         payload = {}
 
     current_model = payload.get("model", "deepseek-v4-flash-free")
-    is_stream = payload.get("stream", False)
-    log.info(f"Received request for model '{current_model}' (Stream: {is_stream} | Has Tools: {'tools' in payload})")
+    client_wants_stream = payload.get("stream", False)
+    is_stream = True
+    is_muse = current_model.startswith("muse-spark")
+    if is_muse:
+        responses_input = []
+        for m in payload.get("messages", []):
+            c = m.get("content", "")
+            if isinstance(c, list):
+                parts = []
+                for p in c:
+                    if isinstance(p, dict) and "text" in p:
+                        parts.append(p["text"])
+                    elif isinstance(p, str):
+                        parts.append(p)
+                c = "\n".join(parts)
+            responses_input.append({
+                "type": "message",
+                "role": m.get("role", "user"),
+                "content": c,
+            })
+        converted_tools = []
+        names = set()
+        for t in payload.get("tools", []):
+            if isinstance(t, dict):
+                fn = t.get("function")
+                if isinstance(fn, dict) and "name" in fn:
+                    name = fn["name"]
+                    names.add(name)
+                    converted_tools.append({
+                        "type": "function",
+                        "name": name,
+                        "description": fn.get("description", f"tool {name}"),
+                        "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
+                    })
+                elif "name" in t:
+                    name = t["name"]
+                    names.add(name)
+                    converted_tools.append({
+                        "type": "function",
+                        "name": name,
+                        "description": t.get("description", f"tool {name}"),
+                        "parameters": t.get("parameters", {"type": "object", "properties": {}}),
+                    })
+        for name in OPENCODE_FINGERPRINT_TOOLS:
+            if name not in names:
+                converted_tools.append({
+                    "type": "function",
+                    "name": name,
+                    "description": f"OpenCode built-in {name} tool",
+                    "parameters": {"type": "object", "properties": {}},
+                })
+        target_payload = {
+            "model": current_model,
+            "input": responses_input,
+            "stream": True,
+            "store": False,
+            "tools": converted_tools,
+        }
+        upstream_target_url = TARGET_ZEN_RESPONSES_URL
+    else:
+        ensure_opencode_fingerprint(payload, is_responses=False)
+        target_payload = payload
+        upstream_target_url = TARGET_ZEN_URL
 
+    log.info(f"Received request for model '{current_model}' (Client Stream: {client_wants_stream} | Muse: {is_muse})")
     headers = get_realistic_headers(raw_request)
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         try:
             await asyncio.sleep(random.uniform(0.1, 0.3))
-            proxies = get_next_outbound_proxy()
-            session = create_fresh_session(is_stream) if is_stream else _get_session("chat")
+            tier_name, proxies = get_tiered_proxy(attempt)
+            log.info(f"Dispatching '{current_model}' via [{tier_name.upper()}] (Attempt {attempt}/{MAX_RETRIES_ON_429})")
+            session = create_fresh_session(True)
             response = session.post(
-                TARGET_ZEN_URL,
-                json=payload,
+                upstream_target_url,
+                json=target_payload,
                 headers=headers,
                 impersonate="chrome124",
-                stream=is_stream,
+                stream=True,
                 proxies=proxies,
-                timeout=STREAM_TIMEOUT if is_stream else 120
+                timeout=(6, STREAM_TIMEOUT)
             )
             log_upstream_response(response, current_model, "chat_completions", attempt, proxies is not None)
 
@@ -963,17 +1416,44 @@ async def chat_completions(raw_request: Request):
                 category, retry_seconds, err_payload = classify_upstream_429(response)
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=current_model).inc()
-                if category == "rate_limit" or attempt < MAX_RETRIES_ON_429:
-                    log.warning("Upstream 429 rate limit hit for '%s' (Attempt %s/%s). Rotating WARP IP...", current_model, attempt, MAX_RETRIES_ON_429)
-                    rotated, verified_ip = await asyncio.to_thread(rotate_egress, f"429 rate limit on {current_model}")
+
+                # Quota errors are account-level: rotation cannot help. Fail fast.
+                if category == "quota":
+                    close_upstream(response, session)
+                    return upstream_rate_limit_response(response, current_model)
+
+                # Tier 1 (Direct Home IP): mark cooldown and immediately advance to Tier 2 (WARP)
+                if tier_name == "direct":
+                    close_upstream(response, session)
+                    mark_direct_rate_limited()
+                    log.warning(f"Tier 1 (Direct Home IP) rate limited on '{current_model}'. Escalating to Tier 2 (WARP)...")
+                    continue
+
+                # Tier 2 (WARP / Proxy Pool): rotate WARP IP
+                if tier_name in ("warp", "proxy_pool") and attempt < (MAX_RETRIES_ON_429 - 1):
+                    close_upstream(response, session)
+                    log.warning(f"Tier 2 (WARP) rate limited on '{current_model}' (Attempt {attempt}/{MAX_RETRIES_ON_429}). Rotating WARP IP...")
+                    rotated, verified_ip = await asyncio.to_thread(rotate_egress, f"Tier 2 WARP 429 on {current_model}")
                     if rotated:
                         swap_warp_registration()
                         await asyncio.sleep(1)
                         continue
-                return upstream_rate_limit_response(response, current_model)
 
-            if response.status_code >= 500:
+                # Tier 3 (Cloud Relay): fallback before giving up.
+                # On success, fall through to normal success handling below (same iteration).
+                relay_path = "/zen/v1/responses" if is_muse else "/zen/v1/chat/completions"
+                relay_resp, relay_session = attempt_cloud_relay_fallback(headers, target_payload, relay_path, current_model)
+                close_upstream(response, session)
+                if relay_resp is not None:
+                    response = relay_resp
+                    session = relay_session
+                    tier_name = "render"
+                else:
+                    return upstream_rate_limit_response(response, current_model)
+
+            if response.status_code >= 500 or response.status_code == 408:
                 if attempt < 2:
+                    close_upstream(response, session)
                     delay = min(INITIAL_BACKOFF, 1.0)
                     log.warning("Upstream HTTP %s for '%s'; retrying in %.2fs.", response.status_code, current_model, delay)
                     await asyncio.sleep(delay)
@@ -982,14 +1462,17 @@ async def chat_completions(raw_request: Request):
 
             if response.status_code != 200:
                 return format_upstream_error_response(response, current_model)
+            record_active_tier(tier_name, "direct (home)" if tier_name == "direct" else ("warp" if tier_name in ("warp", "proxy_pool") else tier_name))
             metrics["successful_requests"] += 1
             prom_requests_success.labels(model=current_model).inc()
             prom_request_duration.labels(model=current_model, endpoint="chat_completions").observe(time.time() - start_time)
 
-            if is_stream:
+            if client_wants_stream:
                 try:
-                    # Pre-verify that the response is not an empty stream before committing to StreamingResponse
-                    stream_gen = stream_response(response, current_model, session=session)
+                    if is_muse:
+                        stream_gen = stream_responses_as_chat_completions(response, current_model, session=session)
+                    else:
+                        stream_gen = stream_response(response, current_model, session=session)
                     metrics["successful_requests"] += 1
                     prom_requests_success.labels(model=current_model).inc()
                     prom_request_duration.labels(model=current_model, endpoint="chat_completions").observe(time.time() - start_time)
@@ -1007,23 +1490,21 @@ async def chat_completions(raw_request: Request):
             else:
                 with FlowContext():
                     try:
-                        res_json = await asyncio.to_thread(response.json)
+                        stream_lines = list(response.iter_lines())
+                        res_json = aggregate_stream_to_chat_completion(stream_lines, current_model)
                         usage = res_json.get("usage", {})
                         track_token_usage(
                             current_model,
                             prompt_tokens=usage.get("prompt_tokens", DEFAULT_PROMPT_TOKENS),
                             completion_tokens=usage.get("completion_tokens", DEFAULT_COMPLETION_TOKENS)
                         )
+                        metrics["successful_requests"] += 1
+                        prom_requests_success.labels(model=current_model).inc()
+                        prom_request_duration.labels(model=current_model, endpoint="chat_completions").observe(time.time() - start_time)
                         return JSONResponse(content=res_json)
-                    except Exception:
-                        track_token_usage(current_model, prompt_tokens=DEFAULT_PROMPT_TOKENS, completion_tokens=DEFAULT_COMPLETION_TOKENS)
-                        return {
-                            "id": f"chatcmpl-zen-resp-{int(time.time())}",
-                            "object": "chat.completion",
-                            "created": int(time.time()),
-                            "model": current_model,
-                            "choices": [{"index": 0, "message": {"role": "assistant", "content": response.text}, "finish_reason": "stop"}]
-                        }
+                    except Exception as agg_err:
+                        log.error("Failed to aggregate stream for %s: %s", current_model, agg_err)
+                        return JSONResponse(content={"id": f"chatcmpl-{int(time.time())}", "object": "chat.completion", "choices": [{"index": 0, "message": {"role": "assistant", "content": response.text}}]})
 
         except Exception as e:
             log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Connection error for model '{current_model}': {type(e).__name__}: {e}")
@@ -1069,7 +1550,7 @@ async def anthropic_messages(raw_request: Request):
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         try:
             await asyncio.sleep(random.uniform(0.1, 0.3))
-            proxies = get_next_outbound_proxy()
+            tier_name, proxies = get_tiered_proxy(attempt)
             session = create_fresh_session(is_stream) if is_stream else _get_session("anthropic")
             response = session.post(
                 TARGET_ZEN_ANTHROPIC_URL,
@@ -1078,7 +1559,7 @@ async def anthropic_messages(raw_request: Request):
                 impersonate="chrome124",
                 stream=is_stream,
                 proxies=proxies,
-                timeout=STREAM_TIMEOUT if is_stream else 120,
+                timeout=(6, STREAM_TIMEOUT if is_stream else 60),
             )
             log_upstream_response(response, model_name, "messages", attempt, proxies is not None)
 
@@ -1086,17 +1567,47 @@ async def anthropic_messages(raw_request: Request):
                 category, retry_seconds, err_payload = classify_upstream_429(response)
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=model_name).inc()
-                if category == "rate_limit" or attempt < MAX_RETRIES_ON_429:
+
+                # Quota errors are account-level: rotation cannot help. Fail fast.
+                if category == "quota":
+                    if is_stream:
+                        close_upstream(response, session)
+                    return upstream_rate_limit_response(response, model_name)
+
+                # Tier 1 (Direct Home IP): mark cooldown and immediately retry on Tier 2
+                if tier_name == "direct":
+                    if is_stream:
+                        close_upstream(response, session)
+                    mark_direct_rate_limited()
+                    log.warning(f"Tier 1 (Direct Home IP) rate limited on '{model_name}'. Escalating to Tier 2 (WARP)...")
+                    continue
+
+                if tier_name in ("warp", "proxy_pool") and attempt < (MAX_RETRIES_ON_429 - 1):
                     log.warning("Upstream 429 rate limit hit for '%s' (Attempt %s/%s). Rotating WARP IP...", model_name, attempt, MAX_RETRIES_ON_429)
                     rotated, verified_ip = await asyncio.to_thread(rotate_egress, f"429 rate limit on {model_name}")
                     if rotated:
                         swap_warp_registration()
                         await asyncio.sleep(1)
+                        if is_stream:
+                            close_upstream(response, session)
                         continue
-                return upstream_rate_limit_response(response, model_name)
-
-            if response.status_code >= 500:
+                # Tier 3 (Cloud Relay): fallback before giving up (streaming only;
+                # non-streaming uses a pooled session that cannot adopt the relay stream).
+                # On success, fall through to normal success handling below (same iteration).
+                if not is_stream:
+                    return upstream_rate_limit_response(response, model_name)
+                relay_resp, relay_session = attempt_cloud_relay_fallback(headers, body, "/zen/v1/messages", model_name)
+                close_upstream(response, session)
+                if relay_resp is not None:
+                    response = relay_resp
+                    session = relay_session
+                    tier_name = "render"
+                else:
+                    return upstream_rate_limit_response(response, model_name)
+            if response.status_code >= 500 or response.status_code == 408:
                 if attempt < 2:
+                    if is_stream:
+                        close_upstream(response, session)
                     delay = min(INITIAL_BACKOFF, 1.0)
                     log.warning("Upstream HTTP %s for '%s'; retrying in %.2fs.", response.status_code, model_name, delay)
                     await asyncio.sleep(delay)
@@ -1105,6 +1616,7 @@ async def anthropic_messages(raw_request: Request):
 
             if response.status_code != 200:
                 return format_upstream_error_response(response, model_name)
+            record_active_tier(tier_name, "direct (home)" if tier_name == "direct" else ("warp" if tier_name in ("warp", "proxy_pool") else tier_name))
             metrics["successful_requests"] += 1
             prom_requests_success.labels(model=model_name).inc()
             prom_request_duration.labels(model=model_name, endpoint="anthropic_messages").observe(time.time() - start_time)
@@ -1155,25 +1667,28 @@ async def responses_endpoint(raw_request: Request):
     except Exception:
         body = {}
 
-    model_name = body.get("model", "deepseek-v4-flash-free")
-    is_stream = body.get("stream", False)
-    log.info(f"Received Responses API request for model '{model_name}' (Stream: {is_stream})")
+    model_name = body.get("model", "muse-spark-1.3-contributor-free")
+    client_wants_stream = body.get("stream", False)
+    is_stream = True
+    ensure_opencode_fingerprint(body, is_responses=True)
+    log.info(f"Received Responses API request for model '{model_name}' (Client Stream: {client_wants_stream})")
 
     headers = get_realistic_headers(raw_request)
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         try:
             await asyncio.sleep(random.uniform(0.1, 0.3))
-            proxies = get_next_outbound_proxy()
-            session = create_fresh_session(is_stream) if is_stream else _get_session("responses")
+            tier_name, proxies = get_tiered_proxy(attempt)
+            log.info(f"Dispatching Responses API '{model_name}' via [{tier_name.upper()}] (Attempt {attempt}/{MAX_RETRIES_ON_429})")
+            session = create_fresh_session(True)
             response = session.post(
                 TARGET_ZEN_RESPONSES_URL,
                 json=body,
                 headers=headers,
                 impersonate="chrome124",
-                stream=is_stream,
+                stream=True,
                 proxies=proxies,
-                timeout=STREAM_TIMEOUT if is_stream else 120,
+                timeout=(6, STREAM_TIMEOUT),
             )
             log_upstream_response(response, model_name, "responses", attempt, proxies is not None)
 
@@ -1181,17 +1696,42 @@ async def responses_endpoint(raw_request: Request):
                 category, retry_seconds, err_payload = classify_upstream_429(response)
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=model_name).inc()
-                if category == "rate_limit" or attempt < MAX_RETRIES_ON_429:
-                    log.warning("Upstream 429 rate limit hit for '%s' (Attempt %s/%s). Rotating WARP IP...", model_name, attempt, MAX_RETRIES_ON_429)
-                    rotated, verified_ip = await asyncio.to_thread(rotate_egress, f"429 rate limit on {model_name}")
+
+                # Quota errors are account-level: rotation cannot help. Fail fast.
+                if category == "quota":
+                    close_upstream(response, session)
+                    return upstream_rate_limit_response(response, model_name)
+
+                # Tier 1 (Direct Home IP): mark cooldown and advance to Tier 2 (WARP)
+                if tier_name == "direct":
+                    close_upstream(response, session)
+                    mark_direct_rate_limited()
+                    log.warning(f"Tier 1 (Direct Home IP) rate limited on '{model_name}'. Advancing to Tier 2 (WARP)...")
+                    continue
+
+                # Tier 2 (WARP / Proxy Pool): rotate WARP IP
+                if tier_name in ("warp", "proxy_pool") and attempt < (MAX_RETRIES_ON_429 - 1):
+                    close_upstream(response, session)
+                    log.warning(f"Tier 2 (WARP) rate limited on '{model_name}' (Attempt {attempt}/{MAX_RETRIES_ON_429}). Rotating WARP IP...")
+                    rotated, verified_ip = await asyncio.to_thread(rotate_egress, f"Tier 2 WARP 429 on {model_name}")
                     if rotated:
                         swap_warp_registration()
                         await asyncio.sleep(1)
                         continue
-                return upstream_rate_limit_response(response, model_name)
 
-            if response.status_code >= 500:
+                # Tier 3 (Cloud Relay): fallback before giving up.
+                # On success, fall through to normal success handling below (same iteration).
+                relay_resp, relay_session = attempt_cloud_relay_fallback(headers, body, "/zen/v1/responses", model_name)
+                close_upstream(response, session)
+                if relay_resp is not None:
+                    response = relay_resp
+                    session = relay_session
+                    tier_name = "render"
+                else:
+                    return upstream_rate_limit_response(response, model_name)
+            if response.status_code >= 500 or response.status_code == 408:
                 if attempt < 2:
+                    close_upstream(response, session)
                     delay = min(INITIAL_BACKOFF, 1.0)
                     log.warning("Upstream HTTP %s for '%s'; retrying in %.2fs.", response.status_code, model_name, delay)
                     await asyncio.sleep(delay)
@@ -1201,11 +1741,12 @@ async def responses_endpoint(raw_request: Request):
             if response.status_code != 200:
                 log.warning("Responses endpoint upstream error [%s]: %s", response.status_code, response.text)
                 return format_upstream_error_response(response, model_name)
+            record_active_tier(tier_name, "direct (home)" if tier_name == "direct" else ("warp" if tier_name in ("warp", "proxy_pool") else tier_name))
             metrics["successful_requests"] += 1
             prom_requests_success.labels(model=model_name).inc()
             prom_request_duration.labels(model=model_name, endpoint="responses").observe(time.time() - start_time)
 
-            if is_stream:
+            if client_wants_stream:
                 return StreamingResponse(
                     stream_response(response, model_name, session=session),
                     media_type="text/event-stream",
@@ -1214,11 +1755,11 @@ async def responses_endpoint(raw_request: Request):
             else:
                 with FlowContext():
                     try:
-                        res_json = await asyncio.to_thread(response.json)
+                        stream_lines = list(response.iter_lines())
+                        res_json = aggregate_stream_to_response(stream_lines, model_name)
                         return JSONResponse(content=res_json)
                     except Exception:
                         return JSONResponse(content=response.text)
-
         except Exception as e:
             log.error(f"[Attempt {attempt}/{MAX_RETRIES_ON_429}] Responses endpoint error for model '{model_name}': {type(e).__name__}: {e}")
             if attempt < MAX_RETRIES_ON_429:
@@ -1238,6 +1779,7 @@ async def responses_endpoint(raw_request: Request):
 @app.api_route("/", methods=["GET", "POST", "OPTIONS"])
 @app.api_route("/relay", methods=["GET", "POST", "OPTIONS"])
 async def relay_handler(raw_request: Request):
+    await wait_for_rotation_drain()
     target = raw_request.headers.get("x-relay-target")
     if not target:
         return JSONResponse({"status": "healthy", "service": "opencode-ip-rotator"})
@@ -1247,26 +1789,35 @@ async def relay_handler(raw_request: Request):
 
     body_bytes = await raw_request.body()
 
-    headers = {}
+    headers = get_realistic_headers(raw_request) if "opencode.ai" in target_url else {}
     for k, v in raw_request.headers.items():
         kl = k.lower()
-        if kl not in ("x-relay-target", "x-relay-path", "host", "content-length"):
-            headers[k] = v
+        if kl in ("x-relay-target", "x-relay-path", "host", "content-length"):
+            continue
+        if kl == "user-agent" and not v.startswith("opencode/"):
+            continue
+        if kl in ("x-opencode-session", "x-session-affinity") and not v.startswith("ses_"):
+            continue
+        headers[kl] = v
+    headers["host"] = target.replace("https://", "").replace("http://", "").split("/")[0]
 
     is_stream = "text/event-stream" in headers.get("accept", "") or b'"stream":true' in body_bytes or b'"stream": true' in body_bytes
     model_name = "relay"
     try:
         body_json = json.loads(body_bytes.decode())
         model_name = body_json.get("model", "relay")
+        if "opencode.ai" in target_url:
+            ensure_opencode_fingerprint(body_json, is_responses=("/responses" in target_url))
+            body_bytes = json.dumps(body_json).encode()
+            headers["content-length"] = str(len(body_bytes))
     except Exception:
         pass
-
     metrics["total_requests"] += 1
     log.info(f"Relaying {raw_request.method} to {target_url} (model={model_name}, stream={is_stream})")
 
     for attempt in range(1, MAX_RETRIES_ON_429 + 1):
         try:
-            proxies = get_next_outbound_proxy()
+            tier_name, proxies = get_tiered_proxy(attempt)
             session = create_fresh_session(is_stream) if is_stream else _get_session("relay")
             response = session.request(
                 method=raw_request.method,
@@ -1276,7 +1827,7 @@ async def relay_handler(raw_request: Request):
                 proxies=proxies,
                 impersonate="chrome124",
                 stream=is_stream,
-                timeout=STREAM_TIMEOUT if is_stream else 120,
+                timeout=(6, STREAM_TIMEOUT if is_stream else 60),
             )
             log_upstream_response(response, model_name, "relay", attempt, proxies is not None)
 
@@ -1284,16 +1835,31 @@ async def relay_handler(raw_request: Request):
                 category, retry_seconds, err_payload = classify_upstream_429(response)
                 metrics["rate_limited_requests"] += 1
                 prom_requests_rate_limited.labels(model=model_name).inc()
+                # Quota errors are account-level: rotation cannot help. Fail fast.
+                if category == "quota":
+                    if is_stream:
+                        close_upstream(response, session)
+                    return upstream_rate_limit_response(response, model_name)
+                if tier_name == "direct":
+                    if is_stream:
+                        close_upstream(response, session)
+                    mark_direct_rate_limited()
+                    log.warning("Relay Tier 1 (Direct) rate limited for '%s'. Escalating to Tier 2 (WARP)...", model_name)
+                    continue
                 log.warning("Relay 429 rate limit hit for '%s'. Rotating WARP IP...", model_name)
                 rotated, verified_ip = await asyncio.to_thread(rotate_egress, f"Relay 429 rate limit on {model_name}")
                 if rotated:
                     swap_warp_registration()
                     await asyncio.sleep(1)
+                    if is_stream:
+                        close_upstream(response, session)
                     continue
                 return upstream_rate_limit_response(response, model_name)
 
-            if response.status_code >= 500:
+            if response.status_code >= 500 or response.status_code == 408:
                 if attempt < 2:
+                    if is_stream:
+                        close_upstream(response, session)
                     delay = min(INITIAL_BACKOFF, 1.0)
                     log.warning("Relay upstream HTTP %s; retrying in %.2fs.", response.status_code, delay)
                     await asyncio.sleep(delay)

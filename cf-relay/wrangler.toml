@@ -1,0 +1,8 @@
+name = "opencode-zen-relay"
+main = "src/index.ts"
+compatibility_date = "2026-04-01"
+
+# NOTE: NEVER commit RELAY_TOKEN here. Set it via:
+#   wrangler secret put RELAY_TOKEN
+# An unset RELAY_TOKEN intentionally leaves auth open (dev mode); production
+# deployments MUST set the secret.
