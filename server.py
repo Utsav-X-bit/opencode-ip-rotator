@@ -45,7 +45,7 @@ DASHBOARD_REFRESH_INTERVAL = 3
 STARTUP_TIME = time.time()
 ENABLE_HTTP2 = os.environ.get("ENABLE_HTTP2", "false").lower() in ("true", "1", "yes")
 STREAM_TIMEOUT = 600
-FALLBACK_RELAY_URL = os.environ.get("FALLBACK_RELAY_URL", "https://relay.xdod.bot.cd").strip()
+FALLBACK_RELAY_URL = os.environ.get("FALLBACK_RELAY_URL", "").strip()  # Set to your own relay URL to enable Tier 3 (e.g. https://your-relay.workers.dev)
 FLOW_LEASE_TTL_SECONDS = int(os.environ.get("FLOW_LEASE_TTL_SECONDS", "90"))
 FLOW_LEASE_HEARTBEAT_SECONDS = int(os.environ.get("FLOW_LEASE_HEARTBEAT_SECONDS", "15"))
 
@@ -959,8 +959,7 @@ def attempt_cloud_relay_fallback(
             model_name,
             FALLBACK_RELAY_URL,
         )
-        relay_headers = dict(headers)
-        relay_headers.pop("host", None)
+        relay_headers = {k: v for k, v in headers.items() if k.lower() not in ("host", "x-relay-target", "x-relay-path")}
         relay_headers["x-relay-target"] = "https://opencode.ai"
         relay_headers["x-relay-path"] = relay_path
         fallback_session = create_fresh_session(True)

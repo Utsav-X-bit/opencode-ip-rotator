@@ -261,7 +261,7 @@ Alternatively, configure it live inside the TUI without restarts:
 | `AUTO_RECYCLE_THRESHOLD` | `50` | Maximum rotations before triggering container environment refresh. |
 | `CORS_ALLOW_ORIGINS` | `http://127.0.0.1:8000,http://localhost:8000` | Comma-separated browser origins allowed to call the proxy. |
 | `WARP_ROTATOR_URL` | `http://127.0.0.1:8001` | Internal rotator endpoint. Do not expose port 8001 publicly. |
-| `FALLBACK_RELAY_URL` | `https://relay.xdod.bot.cd` | Tier 3 cloud relay; full prompts route through it on local-tier exhaustion. Unset to disable. |
+| `FALLBACK_RELAY_URL` | *(unset = Tier 3 disabled)* | Your own cloud relay URL (e.g. `https://your-relay.workers.dev`); full prompts route through it on local-tier exhaustion. |
 | `DIRECT_COOLDOWN_SECONDS` | `300` | Cooldown for Tier 1 after a 429 before direct is retried. |
 | `RELAY_TOKEN` (cf-relay only) | *(unset = open dev mode)* | Set via `wrangler secret put RELAY_TOKEN`; NEVER in `wrangler.toml`. Production MUST set it. |
 
