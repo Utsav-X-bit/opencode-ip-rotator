@@ -1655,6 +1655,9 @@ async def anthropic_messages(raw_request: Request):
     )
 
 @app.post("/v1/responses")
+@app.post("/responses")
+@app.post("/v1/response")
+@app.post("/response")
 async def responses_endpoint(raw_request: Request):
     metrics["total_requests"] += 1
     prom_requests_total.labels(model="responses", endpoint="responses").inc()
@@ -1669,6 +1672,40 @@ async def responses_endpoint(raw_request: Request):
     model_name = body.get("model", "muse-spark-1.3-contributor-free")
     client_wants_stream = body.get("stream", False)
     is_stream = True
+
+    # Convert standard chat messages format to responses input format if needed
+    if "messages" in body and "input" not in body:
+        responses_input = []
+        for m in body.get("messages", []):
+            c = m.get("content", "")
+            if isinstance(c, list):
+                parts = []
+                for p in c:
+                    if isinstance(p, dict) and "text" in p:
+                        parts.append(p["text"])
+                    elif isinstance(p, str):
+                        parts.append(p)
+                c = "\n".join(parts)
+            responses_input.append({
+                "type": "message",
+                "role": m.get("role", "user"),
+                "content": c,
+            })
+        body["input"] = responses_input
+        del body["messages"]
+
+    # Flatten array content inside input items so OpenCode never returns 400
+    if isinstance(body.get("input"), list):
+        for item in body["input"]:
+            if isinstance(item, dict) and isinstance(item.get("content"), list):
+                parts = []
+                for p in item["content"]:
+                    if isinstance(p, dict) and "text" in p:
+                        parts.append(p["text"])
+                    elif isinstance(p, str):
+                        parts.append(p)
+                item["content"] = "\n".join(parts)
+
     ensure_opencode_fingerprint(body, is_responses=True)
     log.info(f"Received Responses API request for model '{model_name}' (Client Stream: {client_wants_stream})")
 
